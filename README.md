@@ -103,21 +103,69 @@ docker pull ghcr.io/jigsawfr/aiometadata-docker:beta
 | `REDIS_URL` | Redis connection URL | `redis://localhost:6379` |
 | `HOST_NAME` | Your public domain | `https://your-domain.com` |
 | `TMDB_API` | TMDB API key ([Get one](https://www.themoviedb.org/settings/api)) | `abc123...` |
-| `DATABASE_URL` | SQLite or PostgreSQL URL | `file:./addon/data/addon.db` |
+| `DATABASE_URI` | SQLite or PostgreSQL URL | `sqlite://addon/data/db.sqlite` |
 
-### Optional
+### Optional - API Keys
+
+| Variable | Description |
+|----------|-------------|
+| `TVDB_API_KEY` | TVDB API key (series/anime metadata) |
+| `FANART_API_KEY` | Fanart.tv API key (logos, backgrounds) |
+| `RPDB_API_KEY` | RatingPosterDB API key (ratings on posters) |
+| `MDBLIST_API_KEY` | MDBList API key (personal lists) |
+| `GEMINI_API_KEY` | Gemini API key (AI search features) |
+
+### Optional - AniList Integration
+
+| Variable | Description |
+|----------|-------------|
+| `ANILIST_CLIENT_ID` | AniList OAuth client ID |
+| `ANILIST_CLIENT_SECRET` | AniList OAuth client secret |
+| `ANILIST_REDIRECT_URI` | AniList callback URL |
+
+### Optional - Trakt Integration
+
+| Variable | Description |
+|----------|-------------|
+| `TRAKT_CLIENT_ID` | Trakt OAuth client ID |
+| `TRAKT_CLIENT_SECRET` | Trakt OAuth client secret |
+| `TRAKT_REDIRECT_URI` | Trakt callback URL |
+
+### Optional - Server Configuration
 
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `PORT` | Server port | `1337` |
+| `NODE_ENV` | Node environment | `production` |
+| `LOG_LEVEL` | Logging level (silent/fatal/error/warn/info/debug/trace) | `info` |
+| `TZ` | Timezone | System default |
 | `ADMIN_KEY` | Dashboard admin key | - |
 | `ADDON_PASSWORD` | Addon protection password | - |
-| `FANART_API` | Fanart.tv API key | - |
-| `RPDB_API_KEY` | RatingPosterDB API key | - |
-| `OMDB_API` | OMDB API key | - |
+| `ADDON_NAME_SUFFIX` | Suffix for addon name in manifest | - |
+| `ADDON_LOGO_URL` | Custom logo URL | - |
+
+### Optional - Cache Configuration
+
+| Variable | Description | Default |
+|----------|-------------|---------|
 | `META_TTL` | Metadata cache TTL (seconds) | `604800` (7 days) |
 | `CATALOG_TTL` | Catalog cache TTL (seconds) | `86400` (1 day) |
-| `LOG_LEVEL` | Logging level | `info` |
+| `CATALOG_LIST_ITEMS_SIZE` | Items per catalog page | `20` |
+| `ENABLE_CACHE_WARMING` | Enable cache warming on startup | `true` |
+| `CACHE_WARMUP_MODE` | Warm-up mode (essential/comprehensive) | `essential` |
+| `CACHE_WARM_INTERVAL_HOURS` | Cache warming interval | `24` |
+
+### Optional - Proxy Configuration
+
+| Variable | Description |
+|----------|-------------|
+| `SOCKS_PROXY_URL` | SOCKS proxy for all requests |
+| `HTTP_PROXY` | HTTP proxy for all requests |
+| `HTTPS_PROXY` | HTTPS proxy for all requests |
+| `TMDB_SOCKS_PROXY_URL` | SOCKS proxy for TMDB requests |
+| `MAL_SOCKS_PROXY_URL` | SOCKS proxy for Jikan/MAL requests |
+
+📖 **Full documentation**: [ENVIRONMENT_VARIABLES.md](https://github.com/cedya77/aiometadata/blob/dev/docs/ENVIRONMENT_VARIABLES.md)
 
 ## 🔐 Verify Image Signature
 
