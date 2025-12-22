@@ -41,12 +41,14 @@ FROM node:20-alpine AS deps
 
 WORKDIR /app
 
+# Install build dependencies for native modules (sqlite3, better-sqlite3, etc.)
+RUN apk add --no-cache python3 make g++ 
+
 # Copy package files from builder
 COPY --from=builder /app/package*.json ./
 
-# Install production dependencies only
-# This layer is cached and reused across versions with same deps
-RUN npm ci --production --ignore-scripts && \
+# Install production dependencies with native compilation
+RUN npm ci --production && \
     npm cache clean --force
 
 # ============================================
