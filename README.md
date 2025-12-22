@@ -7,6 +7,19 @@
 
 > 🐳 Docker images for [AIOMetadata](https://github.com/cedya77/aiometadata) - The Ultimate Stremio Metadata Addon
 
+---
+
+<p align="center">
+  <a href="https://torbox.app/subscription?referral=da9fde09-a917-4953-9214-93b8a12f0b58">
+    <img src="https://torbox.app/assets/logo-bb7a9579.svg" alt="TorBox" height="50"/>
+  </a>
+  <br/><br/>
+  <strong>⚡ Sponsored by <a href="https://torbox.app/subscription?referral=da9fde09-a917-4953-9214-93b8a12f0b58">TorBox</a></strong><br/>
+  Premium Torrent & Usenet Cloud Downloader - 80Gbps Speeds
+</p>
+
+---
+
 This repository automatically builds and publishes versioned Docker images from the official [cedya77/aiometadata](https://github.com/cedya77/aiometadata) releases.
 
 ## ✨ Features
