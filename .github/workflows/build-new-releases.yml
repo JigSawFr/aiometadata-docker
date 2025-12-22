@@ -2,6 +2,7 @@
 # Build New Releases
 # Automatically detects and builds new releases
 # from cedya77/aiometadata every 6 hours
+# Uses native ARM64 runners to avoid QEMU issues
 # ============================================
 
 name: Build New Releases
@@ -59,7 +60,6 @@ jobs:
               console.log(`Force building version: ${forceVersion}`);
               const isPrerelease = forceVersion.includes('beta') || forceVersion.includes('alpha');
               
-              // Get release info
               try {
                 const { data: release } = await github.rest.repos.getReleaseByTag({
                   owner: 'cedya77',
@@ -97,15 +97,14 @@ jobs:
               per_page: 20
             });
             
-            // Find latest stable and beta
             const latestStable = releases.find(r => !r.prerelease && !r.tag_name.includes('beta'));
             const latestBeta = releases.find(r => r.prerelease || r.tag_name.includes('beta'));
             
-            // Check if images exist on ghcr.io
+            // Check if images exist
             const checkImageExists = async (version) => {
               try {
                 const response = await fetch(
-                  `https://ghcr.io/v2/${{ github.repository }}/manifests/${version}`,
+                  `https://ghcr.io/v2/jigsawfr/aiometadata-docker/manifests/${version}`,
                   { method: 'HEAD' }
                 );
                 return response.ok;
@@ -154,26 +153,22 @@ jobs:
               core.setOutput('has_new_beta', 'false');
             }
 
-      - name: Update last check timestamp
-        run: |
-          echo "LAST_CHECK=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_ENV
-          echo "Last check: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_STEP_SUMMARY
-
   # ============================================
-  # Job 2: Build stable release
+  # Job 2: Build stable per-arch (native runners)
   # ============================================
-  build-stable:
-    name: Build Stable Release
+  build-stable-arch:
+    name: Build Stable ${{ matrix.arch }}
     needs: check-releases
     if: needs.check-releases.outputs.has_new_stable == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
     
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -185,8 +180,39 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install Cosign
-        uses: sigstore/cosign-installer@v3
+      - name: Build and Push ${{ matrix.arch }} image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/${{ matrix.arch }}
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.check-releases.outputs.stable_version }}-${{ matrix.arch }}
+          build-args: |
+            VERSION=${{ needs.check-releases.outputs.stable_version }}
+            BUILD_DATE=${{ needs.check-releases.outputs.stable_date }}
+            VCS_REF=${{ needs.check-releases.outputs.stable_sha }}
+          cache-from: type=gha,scope=stable-${{ matrix.arch }}
+          cache-to: type=gha,scope=stable-${{ matrix.arch }},mode=max
+          provenance: false
+          sbom: false
+          outputs: type=image,compression=zstd
+
+  # ============================================
+  # Job 3: Create stable manifest & sign
+  # ============================================
+  create-stable-manifest:
+    name: Stable Manifest
+    needs: [check-releases, build-stable-arch]
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Extract version components
         id: version
@@ -198,62 +224,58 @@ jobs:
           echo "minor=$MINOR" >> $GITHUB_OUTPUT
           echo "major_minor=${MAJOR}.${MINOR}" >> $GITHUB_OUTPUT
 
-      - name: Generate Docker tags
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=${{ needs.check-releases.outputs.stable_version }}
-            type=raw,value=${{ steps.version.outputs.major_minor }}
-            type=raw,value=${{ steps.version.outputs.major }}
-            type=raw,value=latest
-
-      - name: Build and Push Docker image
-        id: build
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            VERSION=${{ needs.check-releases.outputs.stable_version }}
-            BUILD_DATE=${{ needs.check-releases.outputs.stable_date }}
-            VCS_REF=${{ needs.check-releases.outputs.stable_sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          provenance: true
-          sbom: true
-          outputs: type=image,compression=zstd
-
-      - name: Sign image with Cosign
-        env:
-          DIGEST: ${{ steps.build.outputs.digest }}
+      - name: Create multi-arch manifest
         run: |
-          cosign sign --yes ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${DIGEST}
+          VERSION="${{ needs.check-releases.outputs.stable_version }}"
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          
+          echo "📦 Creating manifest for ${VERSION}..."
+          
+          # Create and push version tag
+          docker manifest create ${IMAGE}:${VERSION} \
+            ${IMAGE}:${VERSION}-amd64 \
+            ${IMAGE}:${VERSION}-arm64
+          docker manifest push ${IMAGE}:${VERSION}
+          
+          # Major.minor tag
+          docker manifest create ${IMAGE}:${{ steps.version.outputs.major_minor }} \
+            ${IMAGE}:${VERSION}-amd64 \
+            ${IMAGE}:${VERSION}-arm64
+          docker manifest push ${IMAGE}:${{ steps.version.outputs.major_minor }}
+          
+          # Major tag
+          docker manifest create ${IMAGE}:${{ steps.version.outputs.major }} \
+            ${IMAGE}:${VERSION}-amd64 \
+            ${IMAGE}:${VERSION}-arm64
+          docker manifest push ${IMAGE}:${{ steps.version.outputs.major }}
+          
+          # Latest tag
+          docker manifest create ${IMAGE}:latest \
+            ${IMAGE}:${VERSION}-amd64 \
+            ${IMAGE}:${VERSION}-arm64
+          docker manifest push ${IMAGE}:latest
+          
+          echo "✅ All manifests pushed"
 
-      - name: Generate SBOM attestation
-        uses: anchore/sbom-action@v0
-        with:
-          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
-          artifact-name: sbom-stable-${{ needs.check-releases.outputs.stable_version }}.spdx.json
-          output-file: ./sbom-stable.spdx.json
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
 
-      # Run container tests
+      - name: Sign manifest
+        run: |
+          VERSION="${{ needs.check-releases.outputs.stable_version }}"
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          DIGEST=$(docker manifest inspect ${IMAGE}:${VERSION} -v | jq -r '.Descriptor.digest')
+          
+          echo "🔐 Signing ${IMAGE}@${DIGEST}..."
+          cosign sign --yes ${IMAGE}@${DIGEST}
+
       - name: Test container
         run: |
-          echo "🧪 Starting container test..."
+          echo "🧪 Testing container..."
           
-          # Start Redis
           docker run -d --name redis-test -p 6379:6379 redis:alpine
-          
-          # Wait for Redis
           sleep 5
           
-          # Start the app container
           docker run -d --name app-test \
             --link redis-test:redis \
             -p 1337:1337 \
@@ -263,8 +285,6 @@ jobs:
             -e TMDB_API=test \
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.check-releases.outputs.stable_version }}
           
-          # Wait for healthcheck
-          echo "Waiting for container to be healthy..."
           for i in {1..30}; do
             if curl -sf http://localhost:1337/api/cache/health > /dev/null 2>&1; then
               echo "✅ Container is healthy!"
@@ -275,33 +295,12 @@ jobs:
               docker logs app-test
               exit 1
             fi
-            echo "Waiting... ($i/30)"
             sleep 5
           done
           
-          # Cleanup
           docker stop app-test redis-test
           docker rm app-test redis-test
 
-      # Extract changelog section
-      - name: Extract changelog
-        id: changelog
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const body = `${{ needs.check-releases.outputs.stable_body }}`;
-            
-            // Clean up the changelog body
-            let changelog = body || 'No changelog provided.';
-            
-            // Truncate if too long
-            if (changelog.length > 5000) {
-              changelog = changelog.substring(0, 5000) + '\n\n... (truncated)';
-            }
-            
-            core.setOutput('body', changelog);
-
-      # Create GitHub release
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -316,42 +315,38 @@ jobs:
             
             ### Available Tags
             - `${{ needs.check-releases.outputs.stable_version }}` - This version
-            - `${{ steps.version.outputs.major_minor }}` - Latest patch for this minor
-            - `${{ steps.version.outputs.major }}` - Latest for this major
-            - `latest` - Latest stable release
+            - `${{ steps.version.outputs.major_minor }}` - Latest patch
+            - `${{ steps.version.outputs.major }}` - Latest for major
+            - `latest` - Latest stable
             
-            ## 📋 Changelog (from upstream)
-            
-            ${{ steps.changelog.outputs.body }}
+            ### Architectures
+            - `linux/amd64`
+            - `linux/arm64`
             
             ---
             
             📦 **Source**: [cedya77/aiometadata v${{ needs.check-releases.outputs.stable_version }}](https://github.com/cedya77/aiometadata/releases/tag/v${{ needs.check-releases.outputs.stable_version }})
             
-            🔐 **Image signed with Cosign** - Verify with:
-            ```bash
-            cosign verify ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.check-releases.outputs.stable_version }} --certificate-identity-regexp=".*" --certificate-oidc-issuer-regexp=".*"
-            ```
+            🔐 **Image signed with Cosign**
           draft: false
           prerelease: false
-          files: |
-            sbom-stable.spdx.json
 
   # ============================================
-  # Job 3: Build beta release
+  # Job 4: Build beta per-arch (native runners)
   # ============================================
-  build-beta:
-    name: Build Beta Release
+  build-beta-arch:
+    name: Build Beta ${{ matrix.arch }}
     needs: check-releases
     if: needs.check-releases.outputs.has_new_beta == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
     
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -363,52 +358,72 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install Cosign
-        uses: sigstore/cosign-installer@v3
-
-      - name: Generate Docker tags
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=${{ needs.check-releases.outputs.beta_version }}
-            type=raw,value=beta
-
-      - name: Build and Push Docker image
-        id: build
+      - name: Build and Push ${{ matrix.arch }} image
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/${{ matrix.arch }}
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.check-releases.outputs.beta_version }}-${{ matrix.arch }}
           build-args: |
             VERSION=${{ needs.check-releases.outputs.beta_version }}
             BUILD_DATE=${{ needs.check-releases.outputs.beta_date }}
             VCS_REF=${{ needs.check-releases.outputs.beta_sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          provenance: true
-          sbom: true
+          cache-from: type=gha,scope=beta-${{ matrix.arch }}
+          cache-to: type=gha,scope=beta-${{ matrix.arch }},mode=max
+          provenance: false
+          sbom: false
           outputs: type=image,compression=zstd
 
-      - name: Sign image with Cosign
-        env:
-          DIGEST: ${{ steps.build.outputs.digest }}
-        run: |
-          cosign sign --yes ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${DIGEST}
-
-      - name: Generate SBOM attestation
-        uses: anchore/sbom-action@v0
+  # ============================================
+  # Job 5: Create beta manifest & sign
+  # ============================================
+  create-beta-manifest:
+    name: Beta Manifest
+    needs: [check-releases, build-beta-arch]
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
         with:
-          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
-          artifact-name: sbom-beta-${{ needs.check-releases.outputs.beta_version }}.spdx.json
-          output-file: ./sbom-beta.spdx.json
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Create GitHub pre-release
+      - name: Create multi-arch manifest
+        run: |
+          VERSION="${{ needs.check-releases.outputs.beta_version }}"
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          
+          echo "📦 Creating beta manifest for ${VERSION}..."
+          
+          # Version tag
+          docker manifest create ${IMAGE}:${VERSION} \
+            ${IMAGE}:${VERSION}-amd64 \
+            ${IMAGE}:${VERSION}-arm64
+          docker manifest push ${IMAGE}:${VERSION}
+          
+          # Beta tag
+          docker manifest create ${IMAGE}:beta \
+            ${IMAGE}:${VERSION}-amd64 \
+            ${IMAGE}:${VERSION}-arm64
+          docker manifest push ${IMAGE}:beta
+          
+          echo "✅ Beta manifests pushed"
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign manifest
+        run: |
+          VERSION="${{ needs.check-releases.outputs.beta_version }}"
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          DIGEST=$(docker manifest inspect ${IMAGE}:${VERSION} -v | jq -r '.Descriptor.digest')
+          
+          cosign sign --yes ${IMAGE}@${DIGEST}
+
       - name: Create GitHub Pre-Release
         uses: softprops/action-gh-release@v2
         with:
@@ -427,39 +442,12 @@ jobs:
             docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:beta
             ```
             
+            ### Architectures
+            - `linux/amd64`
+            - `linux/arm64`
+            
             ---
             
             📦 **Source**: [cedya77/aiometadata v${{ needs.check-releases.outputs.beta_version }}](https://github.com/cedya77/aiometadata/releases/tag/v${{ needs.check-releases.outputs.beta_version }})
           draft: false
           prerelease: true
-          files: |
-            sbom-beta.spdx.json
-
-  # ============================================
-  # Job 4: Update README badge
-  # ============================================
-  update-badge:
-    name: Update README Badge
-    needs: [check-releases, build-stable, build-beta]
-    if: always() && (needs.build-stable.result == 'success' || needs.build-beta.result == 'success')
-    runs-on: ubuntu-latest
-    
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Update last check badge
-        run: |
-          TIMESTAMP=$(date -u +%Y-%m-%d\ %H:%M\ UTC)
-          
-          # Update the badge in README if it exists
-          if grep -q "Last Check:" README.md 2>/dev/null; then
-            sed -i "s/Last Check: .*/Last Check: ${TIMESTAMP}/" README.md
-          fi
-
-      - name: Commit badge update
-        uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: "chore: update last check timestamp"
-          file_pattern: README.md
-          skip_dirty_check: false

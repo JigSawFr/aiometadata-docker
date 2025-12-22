@@ -2,6 +2,7 @@
 # Rebuild on Base Image Update
 # Triggered by Renovate PRs for node:20-alpine
 # Rebuilds latest stable with new base image
+# Uses native ARM64 runners to avoid QEMU issues
 # ============================================
 
 name: Rebuild Base Image
@@ -48,7 +49,6 @@ jobs:
       - name: Check if Dockerfile changed
         id: check
         run: |
-          # Check if this is from a Renovate commit or manual trigger
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             echo "should_rebuild=true" >> $GITHUB_OUTPUT
           elif [[ "${{ github.event.head_commit.message }}" == *"renovate"* ]] || \
@@ -72,7 +72,6 @@ jobs:
               return;
             }
             
-            // Get latest stable release from source
             const { data: releases } = await github.rest.repos.listReleases({
               owner: 'cedya77',
               repo: 'aiometadata',
@@ -91,20 +90,21 @@ jobs:
             }
 
   # ============================================
-  # Job 2: Rebuild image
+  # Job 2: Build per-arch (native runners)
   # ============================================
-  rebuild:
-    name: Rebuild ${{ needs.check-trigger.outputs.version }}
+  build-arch:
+    name: Rebuild ${{ needs.check-trigger.outputs.version }} (${{ matrix.arch }})
     needs: check-trigger
     if: needs.check-trigger.outputs.should_rebuild == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
     
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -116,8 +116,39 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install Cosign
-        uses: sigstore/cosign-installer@v3
+      - name: Build and Push ${{ matrix.arch }} image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/${{ matrix.arch }}
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.check-trigger.outputs.version }}-${{ matrix.arch }}
+          build-args: |
+            VERSION=${{ needs.check-trigger.outputs.version }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            VCS_REF=${{ needs.check-trigger.outputs.sha }}
+          # Don't use cache for base image updates
+          no-cache: true
+          provenance: false
+          sbom: false
+          outputs: type=image,compression=zstd
+
+  # ============================================
+  # Job 3: Create manifest & sign
+  # ============================================
+  create-manifest:
+    name: Create Manifest
+    needs: [check-trigger, build-arch]
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Extract version components
         id: version
@@ -129,42 +160,50 @@ jobs:
           echo "minor=$MINOR" >> $GITHUB_OUTPUT
           echo "major_minor=${MAJOR}.${MINOR}" >> $GITHUB_OUTPUT
 
-      - name: Generate Docker tags
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=${{ needs.check-trigger.outputs.version }}
-            type=raw,value=${{ steps.version.outputs.major_minor }}
-            type=raw,value=${{ steps.version.outputs.major }}
-            type=raw,value=latest
-
-      - name: Build and Push Docker image
-        id: build
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            VERSION=${{ needs.check-trigger.outputs.version }}
-            BUILD_DATE=${{ github.event.head_commit.timestamp }}
-            VCS_REF=${{ needs.check-trigger.outputs.sha }}
-          # Don't use cache for base image updates
-          no-cache: true
-          provenance: true
-          sbom: true
-          outputs: type=image,compression=zstd
-
-      - name: Sign image with Cosign
-        env:
-          DIGEST: ${{ steps.build.outputs.digest }}
+      - name: Create multi-arch manifest
         run: |
-          cosign sign --yes ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${DIGEST}
+          VERSION="${{ needs.check-trigger.outputs.version }}"
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          
+          echo "📦 Creating manifest for ${VERSION}..."
+          
+          # Version tag
+          docker manifest create ${IMAGE}:${VERSION} \
+            ${IMAGE}:${VERSION}-amd64 \
+            ${IMAGE}:${VERSION}-arm64
+          docker manifest push ${IMAGE}:${VERSION}
+          
+          # Major.minor tag
+          docker manifest create ${IMAGE}:${{ steps.version.outputs.major_minor }} \
+            ${IMAGE}:${VERSION}-amd64 \
+            ${IMAGE}:${VERSION}-arm64
+          docker manifest push ${IMAGE}:${{ steps.version.outputs.major_minor }}
+          
+          # Major tag
+          docker manifest create ${IMAGE}:${{ steps.version.outputs.major }} \
+            ${IMAGE}:${VERSION}-amd64 \
+            ${IMAGE}:${VERSION}-arm64
+          docker manifest push ${IMAGE}:${{ steps.version.outputs.major }}
+          
+          # Latest tag
+          docker manifest create ${IMAGE}:latest \
+            ${IMAGE}:${VERSION}-amd64 \
+            ${IMAGE}:${VERSION}-arm64
+          docker manifest push ${IMAGE}:latest
+          
+          echo "✅ All manifests pushed"
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign manifest
+        run: |
+          VERSION="${{ needs.check-trigger.outputs.version }}"
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          DIGEST=$(docker manifest inspect ${IMAGE}:${VERSION} -v | jq -r '.Descriptor.digest')
+          
+          echo "🔐 Signing ${IMAGE}@${DIGEST}..."
+          cosign sign --yes ${IMAGE}@${DIGEST}
 
       - name: Test container
         run: |
@@ -200,10 +239,8 @@ jobs:
 
       - name: Summary
         run: |
-          echo "## 🔄 Base Image Rebuild Complete" >> $GITHUB_STEP_SUMMARY
+          echo "## 🔄 Base Image Rebuild Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- **Version**: ${{ needs.check-trigger.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version rebuilt**: ${{ needs.check-trigger.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Architectures**: amd64, arm64 (native runners)" >> $GITHUB_STEP_SUMMARY
           echo "- **Trigger**: ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Image**: \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.check-trigger.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Image rebuilt with latest base image updates." >> $GITHUB_STEP_SUMMARY
