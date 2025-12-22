@@ -26,11 +26,11 @@ This repository automatically builds and publishes versioned Docker images from 
 
 - 🔄 **Auto-sync** - Automatically builds new releases every 6 hours
 - 🏷️ **Versioned tags** - Full semver support (`1.15.0`, `1.15`, `1`, `latest`, `beta`)
-- 🏗️ **Multi-arch** - Supports `linux/amd64` and `linux/arm64`
+- 🏗️ **Multi-arch** - Native builds for `linux/amd64` and `linux/arm64` (no QEMU emulation)
 - 🩺 **Healthcheck** - Built-in Docker HEALTHCHECK for orchestrators
 - 🔐 **Signed images** - All images signed with Cosign (keyless/OIDC)
-- 📋 **SBOM** - Software Bill of Materials attached to each image
 - 🗜️ **Optimized** - Zstd compression for smaller image size
+- 🔄 **Auto-updates** - Base image updates via Renovate
 
 ## 🚀 Quick Start
 
@@ -210,6 +210,30 @@ server {
 ## 🤝 Contributing
 
 Issues and PRs are welcome! For upstream addon issues, please report to [cedya77/aiometadata](https://github.com/cedya77/aiometadata/issues).
+
+## 🏗️ Build Architecture
+
+This project uses **native ARM64 runners** for multi-architecture builds:
+
+```
+┌─────────────────┐     ┌─────────────────┐
+│  ubuntu-latest  │     │ ubuntu-24.04-arm│
+│    (AMD64)      │     │     (ARM64)     │
+├─────────────────┤     ├─────────────────┤
+│ Native build    │     │ Native build    │
+│ → :tag-amd64    │     │ → :tag-arm64    │
+└────────┬────────┘     └────────┬────────┘
+         └───────────┬───────────┘
+                     ▼
+           ┌─────────────────┐
+           │ Create Manifest │
+           ├─────────────────┤
+           │ docker manifest │
+           │    → :tag       │
+           └─────────────────┘
+```
+
+This approach avoids QEMU emulation issues with native modules like sqlite3.
 
 ## 📄 License
 
