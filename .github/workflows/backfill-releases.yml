@@ -1,6 +1,7 @@
 # ============================================
 # Backfill All Historical Releases
 # Republishes ALL releases from cedya77/aiometadata
+# Uses native ARM64 runners to avoid QEMU issues
 # Run manually via workflow_dispatch
 # ============================================
 
@@ -98,27 +99,31 @@ jobs:
             core.setOutput('count', releaseData.length);
 
   # ============================================
-  # Job 2: Build and push each release
+  # Job 2: Build per-arch images (native runners)
   # ============================================
-  build-release:
-    name: Build ${{ matrix.release.tag_full }}
+  build-arch:
+    name: Build ${{ matrix.release.tag_full }} (${{ matrix.arch }})
     needs: fetch-releases
     if: needs.fetch-releases.outputs.count > 0
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
-      max-parallel: 1  # Sequential to maintain order and avoid rate limits
+      max-parallel: 2  # One per arch at a time
       matrix:
         release: ${{ fromJson(needs.fetch-releases.outputs.releases) }}
+        arch: [amd64, arm64]
+    outputs:
+      # We need to pass digest info to the merge job
+      built: ${{ steps.build.outputs.digest != '' }}
     
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Check if image already exists
+      # Check if image already exists (only on amd64 to avoid duplicate checks)
       - name: Check if image exists
         id: check-exists
-        if: inputs.skip_existing == 'true'
+        if: inputs.skip_existing && matrix.arch == 'amd64'
         run: |
           VERSION="${{ matrix.release.tag }}"
           if docker manifest inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${VERSION} > /dev/null 2>&1; then
@@ -131,110 +136,191 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # Skip if exists and skip_existing is true
-      - name: Skip existing
-        if: inputs.skip_existing == 'true' && steps.check-exists.outputs.exists == 'true'
-        run: echo "Skipping ${{ matrix.release.tag_full }} - already exists"
-
-      # Setup QEMU for multi-arch
-      - name: Set up QEMU
-        if: steps.check-exists.outputs.exists != 'true'
-        uses: docker/setup-qemu-action@v3
+      - name: Check skip status
+        id: should-skip
+        run: |
+          if [[ "${{ inputs.skip_existing }}" == "true" && "${{ steps.check-exists.outputs.exists }}" == "true" ]]; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
 
       # Setup Docker Buildx
       - name: Set up Docker Buildx
-        if: steps.check-exists.outputs.exists != 'true'
+        if: steps.should-skip.outputs.skip != 'true'
         uses: docker/setup-buildx-action@v3
 
       # Login to GitHub Container Registry
       - name: Login to GitHub Container Registry
-        if: steps.check-exists.outputs.exists != 'true'
+        if: steps.should-skip.outputs.skip != 'true'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Install Cosign for signing
-      - name: Install Cosign
-        if: steps.check-exists.outputs.exists != 'true' && inputs.dry_run != 'true'
-        uses: sigstore/cosign-installer@v3
+      # Build and push arch-specific image
+      - name: Build and Push ${{ matrix.arch }} image
+        if: steps.should-skip.outputs.skip != 'true'
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/${{ matrix.arch }}
+          push: ${{ inputs.dry_run != true }}
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.release.tag }}-${{ matrix.arch }}
+          build-args: |
+            VERSION=${{ matrix.release.tag }}
+            BUILD_DATE=${{ matrix.release.published_at }}
+            VCS_REF=${{ matrix.release.sha }}
+          cache-from: type=gha,scope=${{ matrix.release.tag }}-${{ matrix.arch }}
+          cache-to: type=gha,scope=${{ matrix.release.tag }}-${{ matrix.arch }},mode=max
+          provenance: false
+          sbom: false
+          outputs: type=image,compression=zstd
 
-      # Generate Docker tags
+  # ============================================
+  # Job 3: Create multi-arch manifest & sign
+  # ============================================
+  create-manifest:
+    name: Manifest ${{ matrix.release.tag_full }}
+    needs: [fetch-releases, build-arch]
+    if: needs.fetch-releases.outputs.count > 0 && inputs.dry_run != true
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        release: ${{ fromJson(needs.fetch-releases.outputs.releases) }}
+    
+    steps:
+      # Login to GitHub Container Registry
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Check if we should skip
+      - name: Check if image exists
+        id: check-exists
+        if: inputs.skip_existing
+        run: |
+          VERSION="${{ matrix.release.tag }}"
+          if docker manifest inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${VERSION} > /dev/null 2>&1; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check skip status
+        id: should-skip
+        run: |
+          if [[ "${{ inputs.skip_existing }}" == "true" && "${{ steps.check-exists.outputs.exists }}" == "true" ]]; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      # Extract version components
       - name: Extract version components
-        if: steps.check-exists.outputs.exists != 'true'
+        if: steps.should-skip.outputs.skip != 'true'
         id: version
         run: |
           VERSION="${{ matrix.release.tag }}"
-          # Handle beta versions like 1.0.0-beta.24.2.2.0
           BASE_VERSION=$(echo "$VERSION" | cut -d'-' -f1)
           MAJOR=$(echo "$BASE_VERSION" | cut -d. -f1)
           MINOR=$(echo "$BASE_VERSION" | cut -d. -f2)
           echo "major=$MAJOR" >> $GITHUB_OUTPUT
           echo "minor=$MINOR" >> $GITHUB_OUTPUT
           echo "major_minor=${MAJOR}.${MINOR}" >> $GITHUB_OUTPUT
-          echo "is_beta=${{ matrix.release.prerelease || contains(matrix.release.tag, 'beta') }}" >> $GITHUB_OUTPUT
+          IS_BETA="${{ matrix.release.prerelease }}"
+          if [[ "$VERSION" == *"beta"* ]]; then IS_BETA="true"; fi
+          echo "is_beta=$IS_BETA" >> $GITHUB_OUTPUT
 
-      - name: Generate Docker tags
-        if: steps.check-exists.outputs.exists != 'true'
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            # Full version tag (e.g., 1.15.0)
-            type=raw,value=${{ matrix.release.tag }}
-            # Major.minor tag (e.g., 1.15) - only for stable
-            type=raw,value=${{ steps.version.outputs.major_minor }},enable=${{ !matrix.release.prerelease && !contains(matrix.release.tag, 'beta') }}
-            # Major tag (e.g., 1) - only for stable
-            type=raw,value=${{ steps.version.outputs.major }},enable=${{ !matrix.release.prerelease && !contains(matrix.release.tag, 'beta') }}
-            # Latest tag - only for the most recent stable
-            type=raw,value=latest,enable=${{ !matrix.release.prerelease && !contains(matrix.release.tag, 'beta') }}
-            # Beta tag for prereleases
-            type=raw,value=beta,enable=${{ matrix.release.prerelease || contains(matrix.release.tag, 'beta') }}
-
-      # Build and push image
-      - name: Build and Push Docker image
-        if: steps.check-exists.outputs.exists != 'true'
-        id: build
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: ${{ inputs.dry_run != 'true' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            VERSION=${{ matrix.release.tag }}
-            BUILD_DATE=${{ matrix.release.published_at }}
-            VCS_REF=${{ matrix.release.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          provenance: true
-          sbom: true
-          outputs: type=image,compression=zstd
-
-      # Sign image with Cosign
-      - name: Sign image with Cosign
-        if: steps.check-exists.outputs.exists != 'true' && inputs.dry_run != 'true' && steps.build.outputs.digest
-        env:
-          DIGEST: ${{ steps.build.outputs.digest }}
+      # Create and push multi-arch manifest
+      - name: Create multi-arch manifest
+        if: steps.should-skip.outputs.skip != 'true'
         run: |
-          echo "Signing image..."
-          cosign sign --yes ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${DIGEST}
+          VERSION="${{ matrix.release.tag }}"
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          
+          echo "📦 Creating manifest for ${VERSION}..."
+          
+          # Create manifest with both architectures
+          docker manifest create ${IMAGE}:${VERSION} \
+            ${IMAGE}:${VERSION}-amd64 \
+            ${IMAGE}:${VERSION}-arm64
+          
+          # Push version tag
+          docker manifest push ${IMAGE}:${VERSION}
+          echo "✅ Pushed ${IMAGE}:${VERSION}"
+          
+          # Additional tags for stable releases
+          if [[ "${{ steps.version.outputs.is_beta }}" != "true" ]]; then
+            # Major.minor tag
+            docker manifest create ${IMAGE}:${{ steps.version.outputs.major_minor }} \
+              ${IMAGE}:${VERSION}-amd64 \
+              ${IMAGE}:${VERSION}-arm64
+            docker manifest push ${IMAGE}:${{ steps.version.outputs.major_minor }}
+            echo "✅ Pushed ${IMAGE}:${{ steps.version.outputs.major_minor }}"
+            
+            # Major tag
+            docker manifest create ${IMAGE}:${{ steps.version.outputs.major }} \
+              ${IMAGE}:${VERSION}-amd64 \
+              ${IMAGE}:${VERSION}-arm64
+            docker manifest push ${IMAGE}:${{ steps.version.outputs.major }}
+            echo "✅ Pushed ${IMAGE}:${{ steps.version.outputs.major }}"
+            
+            # Latest tag
+            docker manifest create ${IMAGE}:latest \
+              ${IMAGE}:${VERSION}-amd64 \
+              ${IMAGE}:${VERSION}-arm64
+            docker manifest push ${IMAGE}:latest
+            echo "✅ Pushed ${IMAGE}:latest"
+          else
+            # Beta tag
+            docker manifest create ${IMAGE}:beta \
+              ${IMAGE}:${VERSION}-amd64 \
+              ${IMAGE}:${VERSION}-arm64
+            docker manifest push ${IMAGE}:beta
+            echo "✅ Pushed ${IMAGE}:beta"
+          fi
 
-      # Add delay to avoid rate limits
-      - name: Rate limit delay
-        if: steps.check-exists.outputs.exists != 'true'
-        run: sleep 30
+      # Install Cosign for signing
+      - name: Install Cosign
+        if: steps.should-skip.outputs.skip != 'true'
+        uses: sigstore/cosign-installer@v3
+
+      # Sign the manifest
+      - name: Sign manifest with Cosign
+        if: steps.should-skip.outputs.skip != 'true'
+        run: |
+          VERSION="${{ matrix.release.tag }}"
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          
+          # Get the manifest digest
+          DIGEST=$(docker manifest inspect ${IMAGE}:${VERSION} -v | jq -r '.Descriptor.digest')
+          
+          echo "🔐 Signing ${IMAGE}@${DIGEST}..."
+          cosign sign --yes ${IMAGE}@${DIGEST}
+          echo "✅ Signed successfully"
+
+      # Cleanup arch-specific tags (optional, keeps registry clean)
+      - name: Cleanup arch-specific tags
+        if: steps.should-skip.outputs.skip != 'true'
+        continue-on-error: true
+        run: |
+          echo "🧹 Arch-specific tags (${VERSION}-amd64, ${VERSION}-arm64) kept for manifest reference"
 
   # ============================================
-  # Job 3: Summary
+  # Job 4: Summary
   # ============================================
   summary:
     name: Build Summary
-    needs: [fetch-releases, build-release]
+    needs: [fetch-releases, build-arch, create-manifest]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -243,6 +329,7 @@ jobs:
           echo "## 📦 Backfill Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "- **Total releases processed**: ${{ needs.fetch-releases.outputs.count }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Architectures**: amd64, arm64 (native runners)" >> $GITHUB_STEP_SUMMARY
           echo "- **Dry run**: ${{ inputs.dry_run }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Skip existing**: ${{ inputs.skip_existing }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
