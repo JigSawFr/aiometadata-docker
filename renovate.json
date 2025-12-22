@@ -1,0 +1,93 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    "docker:enableMajor",
+    ":semanticCommits",
+    ":maintainLockFilesWeekly"
+  ],
+  "description": "Renovate configuration for aiometadata-docker",
+  "timezone": "Europe/Paris",
+  "schedule": [
+    "before 6am on Monday"
+  ],
+  "labels": ["dependencies", "renovate"],
+  "prHourlyLimit": 2,
+  "prConcurrentLimit": 5,
+  "platformAutomerge": true,
+  "packageRules": [
+    {
+      "description": "Node.js Alpine base image - auto-merge minor/patch",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["node"],
+      "matchUpdateTypes": ["minor", "patch", "digest"],
+      "automerge": true,
+      "automergeType": "pr",
+      "automergeStrategy": "squash",
+      "groupName": "node-alpine",
+      "groupSlug": "node-alpine",
+      "commitMessagePrefix": "chore(docker):",
+      "commitMessageTopic": "Node.js Alpine base image"
+    },
+    {
+      "description": "Node.js Alpine major updates - require manual review",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["node"],
+      "matchUpdateTypes": ["major"],
+      "automerge": false,
+      "labels": ["dependencies", "major", "breaking"],
+      "commitMessagePrefix": "chore(docker):",
+      "commitMessageTopic": "Node.js Alpine base image"
+    },
+    {
+      "description": "GitHub Actions - group and auto-merge",
+      "matchManagers": ["github-actions"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "automerge": true,
+      "automergeType": "pr",
+      "automergeStrategy": "squash",
+      "groupName": "github-actions",
+      "groupSlug": "gha",
+      "commitMessagePrefix": "chore(ci):",
+      "schedule": ["before 6am on Monday"]
+    },
+    {
+      "description": "GitHub Actions major - manual review",
+      "matchManagers": ["github-actions"],
+      "matchUpdateTypes": ["major"],
+      "automerge": false,
+      "labels": ["dependencies", "major", "ci"]
+    },
+    {
+      "description": "Redis base image - auto-merge",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["redis"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "automerge": true,
+      "automergeType": "pr",
+      "groupName": "redis",
+      "commitMessagePrefix": "chore(docker):"
+    }
+  ],
+  "dockerfile": {
+    "fileMatch": ["(^|/)Dockerfile$", "(^|/)Dockerfile\\.[^/]*$"]
+  },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Update node version in Dockerfile FROM statements",
+      "fileMatch": ["^Dockerfile$"],
+      "matchStrings": [
+        "FROM\\s+node:(?<currentValue>[\\d.]+-alpine)\\s+AS"
+      ],
+      "datasourceTemplate": "docker",
+      "depNameTemplate": "node",
+      "versioningTemplate": "docker"
+    }
+  ],
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "labels": ["security"]
+  },
+  "osvVulnerabilityAlerts": true
+}

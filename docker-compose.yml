@@ -1,0 +1,138 @@
+# ============================================
+# AIOMetadata Docker Compose
+# Ready-to-use deployment configuration
+# https://github.com/JigSawFr/aiometadata-docker
+# ============================================
+
+services:
+  # ============================================
+  # AIOMetadata - Stremio Metadata Addon
+  # ============================================
+  aiometadata:
+    image: ghcr.io/jigsawfr/aiometadata-docker:latest
+    container_name: aiometadata
+    restart: unless-stopped
+    ports:
+      - "1337:1337"
+    # For Traefik users, uncomment expose and comment ports:
+    # expose:
+    #   - 1337
+    environment:
+      # ========== REQUIRED ==========
+      # Redis connection (required for caching)
+      - REDIS_URL=redis://aiometadata_redis:6379
+      
+      # Your public domain (without trailing slash)
+      - HOST_NAME=${HOST_NAME:-http://localhost:1337}
+      
+      # TMDB API key (required) - Get from https://www.themoviedb.org/settings/api
+      - TMDB_API=${TMDB_API}
+      
+      # Database URL - SQLite (default) or PostgreSQL
+      - DATABASE_URL=${DATABASE_URL:-file:./addon/data/addon.db}
+      
+      # ========== OPTIONAL ==========
+      # Server port (default: 1337)
+      - PORT=${PORT:-1337}
+      
+      # Node environment
+      - NODE_ENV=${NODE_ENV:-production}
+      
+      # Admin key for dashboard access (recommended)
+      - ADMIN_KEY=${ADMIN_KEY:-}
+      
+      # Addon password protection
+      - ADDON_PASSWORD=${ADDON_PASSWORD:-}
+      
+      # Fanart.tv API key - Get from https://fanart.tv/get-an-api-key/
+      - FANART_API=${FANART_API:-}
+      
+      # RPDB API key for rating posters - Get from https://ratingposterdb.com/
+      - RPDB_API_KEY=${RPDB_API_KEY:-}
+      
+      # OMDB API key - Get from https://www.omdbapi.com/apikey.aspx
+      - OMDB_API=${OMDB_API:-}
+      
+      # Custom Jikan API base (for MyAnimeList)
+      - JIKAN_API_BASE=${JIKAN_API_BASE:-https://api.jikan.moe/v4}
+      
+      # ========== CACHE SETTINGS ==========
+      # Cache TTL in seconds
+      - META_TTL=${META_TTL:-604800}
+      - CATALOG_TTL=${CATALOG_TTL:-86400}
+      
+      # Disable cache (not recommended)
+      - NO_CACHE=${NO_CACHE:-false}
+      
+      # ========== LOGGING ==========
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      
+    volumes:
+      # Persist SQLite database and user data
+      - ${DOCKER_DATA_DIR:-./data}/aiometadata/data:/app/addon/data
+    
+    depends_on:
+      aiometadata_redis:
+        condition: service_healthy
+    
+    # Health check configuration
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:1337/api/cache/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+    
+    # ========== TRAEFIK LABELS (Optional) ==========
+    # Uncomment and configure for Traefik reverse proxy
+    # labels:
+    #   - "traefik.enable=true"
+    #   - "traefik.http.routers.aiometadata.rule=Host(`${AIOMETADATA_HOSTNAME}`)"
+    #   - "traefik.http.routers.aiometadata.entrypoints=websecure"
+    #   - "traefik.http.routers.aiometadata.tls.certresolver=letsencrypt"
+    #   - "traefik.http.services.aiometadata.loadbalancer.server.port=1337"
+
+  # ============================================
+  # Redis - Cache Backend
+  # ============================================
+  aiometadata_redis:
+    image: redis:alpine
+    container_name: aiometadata_redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --save 60 1
+    volumes:
+      # Persist Redis data
+      - ${DOCKER_DATA_DIR:-./data}/aiometadata/redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ============================================
+  # PostgreSQL - Database (Optional)
+  # Uncomment to use PostgreSQL instead of SQLite
+  # ============================================
+  # aiometadata_postgres:
+  #   image: postgres:16-alpine
+  #   container_name: aiometadata_postgres
+  #   restart: unless-stopped
+  #   environment:
+  #     - POSTGRES_DB=aiometadata
+  #     - POSTGRES_USER=${POSTGRES_USER:-aiometadata}
+  #     - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-changeme}
+  #   volumes:
+  #     - ${DOCKER_DATA_DIR:-./data}/aiometadata/postgres:/var/lib/postgresql/data
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-aiometadata} -d aiometadata"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
+
+# ============================================
+# Networks (Optional)
+# ============================================
+# networks:
+#   default:
+#     name: aiometadata
+#     external: false

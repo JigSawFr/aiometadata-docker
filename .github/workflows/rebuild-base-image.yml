@@ -1,0 +1,209 @@
+# ============================================
+# Rebuild on Base Image Update
+# Triggered by Renovate PRs for node:20-alpine
+# Rebuilds latest stable with new base image
+# ============================================
+
+name: Rebuild Base Image
+
+on:
+  # Triggered when Renovate PR is merged
+  push:
+    branches:
+      - main
+    paths:
+      - 'Dockerfile'
+  
+  # Manual trigger
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to rebuild (leave empty for latest stable)'
+        required: false
+        default: ''
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  SOURCE_REPO: cedya77/aiometadata
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+
+jobs:
+  # ============================================
+  # Job 1: Check if Dockerfile changed
+  # ============================================
+  check-trigger:
+    name: Check Trigger
+    runs-on: ubuntu-latest
+    outputs:
+      should_rebuild: ${{ steps.check.outputs.should_rebuild }}
+      version: ${{ steps.version.outputs.version }}
+      sha: ${{ steps.version.outputs.sha }}
+    
+    steps:
+      - name: Check if Dockerfile changed
+        id: check
+        run: |
+          # Check if this is from a Renovate commit or manual trigger
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "should_rebuild=true" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.event.head_commit.message }}" == *"renovate"* ]] || \
+               [[ "${{ github.event.head_commit.message }}" == *"node"* ]] || \
+               [[ "${{ github.event.head_commit.message }}" == *"alpine"* ]]; then
+            echo "should_rebuild=true" >> $GITHUB_OUTPUT
+          else
+            echo "should_rebuild=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Get latest stable version
+        id: version
+        if: steps.check.outputs.should_rebuild == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const forceVersion = '${{ inputs.version }}';
+            
+            if (forceVersion) {
+              core.setOutput('version', forceVersion.replace(/^v/, ''));
+              return;
+            }
+            
+            // Get latest stable release from source
+            const { data: releases } = await github.rest.repos.listReleases({
+              owner: 'cedya77',
+              repo: 'aiometadata',
+              per_page: 10
+            });
+            
+            const latestStable = releases.find(r => !r.prerelease && !r.tag_name.includes('beta'));
+            
+            if (latestStable) {
+              const version = latestStable.tag_name.replace(/^v/, '');
+              core.setOutput('version', version);
+              core.setOutput('sha', latestStable.target_commitish);
+              console.log(`Latest stable version: ${version}`);
+            } else {
+              core.setFailed('No stable release found');
+            }
+
+  # ============================================
+  # Job 2: Rebuild image
+  # ============================================
+  rebuild:
+    name: Rebuild ${{ needs.check-trigger.outputs.version }}
+    needs: check-trigger
+    if: needs.check-trigger.outputs.should_rebuild == 'true'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Extract version components
+        id: version
+        run: |
+          VERSION="${{ needs.check-trigger.outputs.version }}"
+          MAJOR=$(echo $VERSION | cut -d. -f1)
+          MINOR=$(echo $VERSION | cut -d. -f2)
+          echo "major=$MAJOR" >> $GITHUB_OUTPUT
+          echo "minor=$MINOR" >> $GITHUB_OUTPUT
+          echo "major_minor=${MAJOR}.${MINOR}" >> $GITHUB_OUTPUT
+
+      - name: Generate Docker tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ needs.check-trigger.outputs.version }}
+            type=raw,value=${{ steps.version.outputs.major_minor }}
+            type=raw,value=${{ steps.version.outputs.major }}
+            type=raw,value=latest
+
+      - name: Build and Push Docker image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ needs.check-trigger.outputs.version }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            VCS_REF=${{ needs.check-trigger.outputs.sha }}
+          # Don't use cache for base image updates
+          no-cache: true
+          provenance: true
+          sbom: true
+          outputs: type=image,compression=zstd
+
+      - name: Sign image with Cosign
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          cosign sign --yes ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${DIGEST}
+
+      - name: Test container
+        run: |
+          echo "🧪 Testing rebuilt container..."
+          
+          docker run -d --name redis-test -p 6379:6379 redis:alpine
+          sleep 5
+          
+          docker run -d --name app-test \
+            --link redis-test:redis \
+            -p 1337:1337 \
+            -e REDIS_URL=redis://redis:6379 \
+            -e HOST_NAME=http://localhost:1337 \
+            -e DATABASE_URL=file:./addon/data/addon.db \
+            -e TMDB_API=test \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.check-trigger.outputs.version }}
+          
+          for i in {1..30}; do
+            if curl -sf http://localhost:1337/api/cache/health > /dev/null 2>&1; then
+              echo "✅ Container is healthy!"
+              break
+            fi
+            if [ $i -eq 30 ]; then
+              echo "❌ Container failed to become healthy"
+              docker logs app-test
+              exit 1
+            fi
+            sleep 5
+          done
+          
+          docker stop app-test redis-test
+          docker rm app-test redis-test
+
+      - name: Summary
+        run: |
+          echo "## 🔄 Base Image Rebuild Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version**: ${{ needs.check-trigger.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Trigger**: ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image**: \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.check-trigger.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Image rebuilt with latest base image updates." >> $GITHUB_STEP_SUMMARY

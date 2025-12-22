@@ -1,0 +1,249 @@
+# ============================================
+# Backfill All Historical Releases
+# Republishes ALL releases from cedya77/aiometadata
+# Run manually via workflow_dispatch
+# ============================================
+
+name: Backfill Historical Releases
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_from_version:
+        description: 'Start from specific version (leave empty for all)'
+        required: false
+        default: ''
+      dry_run:
+        description: 'Dry run (no push)'
+        required: false
+        default: false
+        type: boolean
+      skip_existing:
+        description: 'Skip versions that already exist on ghcr.io'
+        required: false
+        default: true
+        type: boolean
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  SOURCE_REPO: cedya77/aiometadata
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write  # For cosign OIDC
+
+jobs:
+  # ============================================
+  # Job 1: Fetch all releases from source repo
+  # ============================================
+  fetch-releases:
+    name: Fetch All Releases
+    runs-on: ubuntu-latest
+    outputs:
+      releases: ${{ steps.get-releases.outputs.releases }}
+      count: ${{ steps.get-releases.outputs.count }}
+    steps:
+      - name: Fetch releases from source repository
+        id: get-releases
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const allReleases = [];
+            let page = 1;
+            
+            // Fetch all releases with pagination
+            while (true) {
+              const { data: releases } = await github.rest.repos.listReleases({
+                owner: 'cedya77',
+                repo: 'aiometadata',
+                per_page: 100,
+                page: page
+              });
+              
+              if (releases.length === 0) break;
+              allReleases.push(...releases);
+              page++;
+            }
+            
+            // Sort chronologically (oldest first)
+            allReleases.sort((a, b) => new Date(a.published_at) - new Date(b.published_at));
+            
+            // Filter based on start_from_version if provided
+            const startFrom = '${{ inputs.start_from_version }}';
+            let filteredReleases = allReleases;
+            
+            if (startFrom) {
+              const startIndex = allReleases.findIndex(r => r.tag_name === `v${startFrom}` || r.tag_name === startFrom);
+              if (startIndex !== -1) {
+                filteredReleases = allReleases.slice(startIndex);
+              }
+            }
+            
+            // Map to simplified format
+            const releaseData = filteredReleases.map(r => ({
+              tag: r.tag_name.replace(/^v/, ''),
+              tag_full: r.tag_name,
+              prerelease: r.prerelease,
+              published_at: r.published_at,
+              body: r.body || '',
+              sha: r.target_commitish
+            }));
+            
+            console.log(`Found ${releaseData.length} releases to process`);
+            releaseData.forEach(r => console.log(`  - ${r.tag_full} (${r.prerelease ? 'prerelease' : 'stable'})`));
+            
+            core.setOutput('releases', JSON.stringify(releaseData));
+            core.setOutput('count', releaseData.length);
+
+  # ============================================
+  # Job 2: Build and push each release
+  # ============================================
+  build-release:
+    name: Build ${{ matrix.release.tag_full }}
+    needs: fetch-releases
+    if: needs.fetch-releases.outputs.count > 0
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 1  # Sequential to maintain order and avoid rate limits
+      matrix:
+        release: ${{ fromJson(needs.fetch-releases.outputs.releases) }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Check if image already exists
+      - name: Check if image exists
+        id: check-exists
+        if: inputs.skip_existing == 'true'
+        run: |
+          VERSION="${{ matrix.release.tag }}"
+          if docker manifest inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${VERSION} > /dev/null 2>&1; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "⏭️ Image ${VERSION} already exists, skipping..."
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "📦 Image ${VERSION} not found, will build..."
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Skip if exists and skip_existing is true
+      - name: Skip existing
+        if: inputs.skip_existing == 'true' && steps.check-exists.outputs.exists == 'true'
+        run: echo "Skipping ${{ matrix.release.tag_full }} - already exists"
+
+      # Setup QEMU for multi-arch
+      - name: Set up QEMU
+        if: steps.check-exists.outputs.exists != 'true'
+        uses: docker/setup-qemu-action@v3
+
+      # Setup Docker Buildx
+      - name: Set up Docker Buildx
+        if: steps.check-exists.outputs.exists != 'true'
+        uses: docker/setup-buildx-action@v3
+
+      # Login to GitHub Container Registry
+      - name: Login to GitHub Container Registry
+        if: steps.check-exists.outputs.exists != 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Install Cosign for signing
+      - name: Install Cosign
+        if: steps.check-exists.outputs.exists != 'true' && inputs.dry_run != 'true'
+        uses: sigstore/cosign-installer@v3
+
+      # Generate Docker tags
+      - name: Extract version components
+        if: steps.check-exists.outputs.exists != 'true'
+        id: version
+        run: |
+          VERSION="${{ matrix.release.tag }}"
+          # Handle beta versions like 1.0.0-beta.24.2.2.0
+          BASE_VERSION=$(echo "$VERSION" | cut -d'-' -f1)
+          MAJOR=$(echo "$BASE_VERSION" | cut -d. -f1)
+          MINOR=$(echo "$BASE_VERSION" | cut -d. -f2)
+          echo "major=$MAJOR" >> $GITHUB_OUTPUT
+          echo "minor=$MINOR" >> $GITHUB_OUTPUT
+          echo "major_minor=${MAJOR}.${MINOR}" >> $GITHUB_OUTPUT
+          echo "is_beta=${{ matrix.release.prerelease || contains(matrix.release.tag, 'beta') }}" >> $GITHUB_OUTPUT
+
+      - name: Generate Docker tags
+        if: steps.check-exists.outputs.exists != 'true'
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            # Full version tag (e.g., 1.15.0)
+            type=raw,value=${{ matrix.release.tag }}
+            # Major.minor tag (e.g., 1.15) - only for stable
+            type=raw,value=${{ steps.version.outputs.major_minor }},enable=${{ !matrix.release.prerelease && !contains(matrix.release.tag, 'beta') }}
+            # Major tag (e.g., 1) - only for stable
+            type=raw,value=${{ steps.version.outputs.major }},enable=${{ !matrix.release.prerelease && !contains(matrix.release.tag, 'beta') }}
+            # Latest tag - only for the most recent stable
+            type=raw,value=latest,enable=${{ !matrix.release.prerelease && !contains(matrix.release.tag, 'beta') }}
+            # Beta tag for prereleases
+            type=raw,value=beta,enable=${{ matrix.release.prerelease || contains(matrix.release.tag, 'beta') }}
+
+      # Build and push image
+      - name: Build and Push Docker image
+        if: steps.check-exists.outputs.exists != 'true'
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ inputs.dry_run != 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ matrix.release.tag }}
+            BUILD_DATE=${{ matrix.release.published_at }}
+            VCS_REF=${{ matrix.release.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+          outputs: type=image,compression=zstd
+
+      # Sign image with Cosign
+      - name: Sign image with Cosign
+        if: steps.check-exists.outputs.exists != 'true' && inputs.dry_run != 'true' && steps.build.outputs.digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          echo "Signing image..."
+          cosign sign --yes ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${DIGEST}
+
+      # Add delay to avoid rate limits
+      - name: Rate limit delay
+        if: steps.check-exists.outputs.exists != 'true'
+        run: sleep 30
+
+  # ============================================
+  # Job 3: Summary
+  # ============================================
+  summary:
+    name: Build Summary
+    needs: [fetch-releases, build-release]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Summary
+        run: |
+          echo "## 📦 Backfill Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Total releases processed**: ${{ needs.fetch-releases.outputs.count }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Dry run**: ${{ inputs.dry_run }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Skip existing**: ${{ inputs.skip_existing }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "All historical releases have been processed!" >> $GITHUB_STEP_SUMMARY

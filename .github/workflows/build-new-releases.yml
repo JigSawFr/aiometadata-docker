@@ -1,0 +1,465 @@
+# ============================================
+# Build New Releases
+# Automatically detects and builds new releases
+# from cedya77/aiometadata every 6 hours
+# ============================================
+
+name: Build New Releases
+
+on:
+  schedule:
+    # Run every 6 hours
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      force_version:
+        description: 'Force build specific version (leave empty for auto-detect)'
+        required: false
+        default: ''
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  SOURCE_REPO: cedya77/aiometadata
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write  # For cosign OIDC
+
+jobs:
+  # ============================================
+  # Job 1: Check for new releases
+  # ============================================
+  check-releases:
+    name: Check for New Releases
+    runs-on: ubuntu-latest
+    outputs:
+      has_new_stable: ${{ steps.check.outputs.has_new_stable }}
+      has_new_beta: ${{ steps.check.outputs.has_new_beta }}
+      stable_version: ${{ steps.check.outputs.stable_version }}
+      stable_sha: ${{ steps.check.outputs.stable_sha }}
+      stable_body: ${{ steps.check.outputs.stable_body }}
+      stable_date: ${{ steps.check.outputs.stable_date }}
+      beta_version: ${{ steps.check.outputs.beta_version }}
+      beta_sha: ${{ steps.check.outputs.beta_sha }}
+      beta_body: ${{ steps.check.outputs.beta_body }}
+      beta_date: ${{ steps.check.outputs.beta_date }}
+    
+    steps:
+      - name: Check for new releases
+        id: check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Force version override
+            const forceVersion = '${{ inputs.force_version }}';
+            
+            if (forceVersion) {
+              console.log(`Force building version: ${forceVersion}`);
+              const isPrerelease = forceVersion.includes('beta') || forceVersion.includes('alpha');
+              
+              // Get release info
+              try {
+                const { data: release } = await github.rest.repos.getReleaseByTag({
+                  owner: 'cedya77',
+                  repo: 'aiometadata',
+                  tag: forceVersion.startsWith('v') ? forceVersion : `v${forceVersion}`
+                });
+                
+                const version = release.tag_name.replace(/^v/, '');
+                
+                if (isPrerelease) {
+                  core.setOutput('has_new_beta', 'true');
+                  core.setOutput('has_new_stable', 'false');
+                  core.setOutput('beta_version', version);
+                  core.setOutput('beta_sha', release.target_commitish);
+                  core.setOutput('beta_body', release.body || '');
+                  core.setOutput('beta_date', release.published_at);
+                } else {
+                  core.setOutput('has_new_stable', 'true');
+                  core.setOutput('has_new_beta', 'false');
+                  core.setOutput('stable_version', version);
+                  core.setOutput('stable_sha', release.target_commitish);
+                  core.setOutput('stable_body', release.body || '');
+                  core.setOutput('stable_date', release.published_at);
+                }
+                return;
+              } catch (e) {
+                console.log(`Release ${forceVersion} not found: ${e.message}`);
+              }
+            }
+            
+            // Get all releases from source
+            const { data: releases } = await github.rest.repos.listReleases({
+              owner: 'cedya77',
+              repo: 'aiometadata',
+              per_page: 20
+            });
+            
+            // Find latest stable and beta
+            const latestStable = releases.find(r => !r.prerelease && !r.tag_name.includes('beta'));
+            const latestBeta = releases.find(r => r.prerelease || r.tag_name.includes('beta'));
+            
+            // Check if images exist on ghcr.io
+            const checkImageExists = async (version) => {
+              try {
+                const response = await fetch(
+                  `https://ghcr.io/v2/${{ github.repository }}/manifests/${version}`,
+                  { method: 'HEAD' }
+                );
+                return response.ok;
+              } catch {
+                return false;
+              }
+            };
+            
+            // Check stable
+            if (latestStable) {
+              const stableVersion = latestStable.tag_name.replace(/^v/, '');
+              const stableExists = await checkImageExists(stableVersion);
+              
+              if (!stableExists) {
+                console.log(`New stable release found: ${stableVersion}`);
+                core.setOutput('has_new_stable', 'true');
+                core.setOutput('stable_version', stableVersion);
+                core.setOutput('stable_sha', latestStable.target_commitish);
+                core.setOutput('stable_body', latestStable.body || '');
+                core.setOutput('stable_date', latestStable.published_at);
+              } else {
+                console.log(`Stable release ${stableVersion} already exists`);
+                core.setOutput('has_new_stable', 'false');
+              }
+            } else {
+              core.setOutput('has_new_stable', 'false');
+            }
+            
+            // Check beta
+            if (latestBeta) {
+              const betaVersion = latestBeta.tag_name.replace(/^v/, '');
+              const betaExists = await checkImageExists(betaVersion);
+              
+              if (!betaExists) {
+                console.log(`New beta release found: ${betaVersion}`);
+                core.setOutput('has_new_beta', 'true');
+                core.setOutput('beta_version', betaVersion);
+                core.setOutput('beta_sha', latestBeta.target_commitish);
+                core.setOutput('beta_body', latestBeta.body || '');
+                core.setOutput('beta_date', latestBeta.published_at);
+              } else {
+                console.log(`Beta release ${betaVersion} already exists`);
+                core.setOutput('has_new_beta', 'false');
+              }
+            } else {
+              core.setOutput('has_new_beta', 'false');
+            }
+
+      - name: Update last check timestamp
+        run: |
+          echo "LAST_CHECK=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_ENV
+          echo "Last check: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_STEP_SUMMARY
+
+  # ============================================
+  # Job 2: Build stable release
+  # ============================================
+  build-stable:
+    name: Build Stable Release
+    needs: check-releases
+    if: needs.check-releases.outputs.has_new_stable == 'true'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Extract version components
+        id: version
+        run: |
+          VERSION="${{ needs.check-releases.outputs.stable_version }}"
+          MAJOR=$(echo $VERSION | cut -d. -f1)
+          MINOR=$(echo $VERSION | cut -d. -f2)
+          echo "major=$MAJOR" >> $GITHUB_OUTPUT
+          echo "minor=$MINOR" >> $GITHUB_OUTPUT
+          echo "major_minor=${MAJOR}.${MINOR}" >> $GITHUB_OUTPUT
+
+      - name: Generate Docker tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ needs.check-releases.outputs.stable_version }}
+            type=raw,value=${{ steps.version.outputs.major_minor }}
+            type=raw,value=${{ steps.version.outputs.major }}
+            type=raw,value=latest
+
+      - name: Build and Push Docker image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ needs.check-releases.outputs.stable_version }}
+            BUILD_DATE=${{ needs.check-releases.outputs.stable_date }}
+            VCS_REF=${{ needs.check-releases.outputs.stable_sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+          outputs: type=image,compression=zstd
+
+      - name: Sign image with Cosign
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          cosign sign --yes ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${DIGEST}
+
+      - name: Generate SBOM attestation
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          artifact-name: sbom-stable-${{ needs.check-releases.outputs.stable_version }}.spdx.json
+          output-file: ./sbom-stable.spdx.json
+
+      # Run container tests
+      - name: Test container
+        run: |
+          echo "🧪 Starting container test..."
+          
+          # Start Redis
+          docker run -d --name redis-test -p 6379:6379 redis:alpine
+          
+          # Wait for Redis
+          sleep 5
+          
+          # Start the app container
+          docker run -d --name app-test \
+            --link redis-test:redis \
+            -p 1337:1337 \
+            -e REDIS_URL=redis://redis:6379 \
+            -e HOST_NAME=http://localhost:1337 \
+            -e DATABASE_URL=file:./addon/data/addon.db \
+            -e TMDB_API=test \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.check-releases.outputs.stable_version }}
+          
+          # Wait for healthcheck
+          echo "Waiting for container to be healthy..."
+          for i in {1..30}; do
+            if curl -sf http://localhost:1337/api/cache/health > /dev/null 2>&1; then
+              echo "✅ Container is healthy!"
+              break
+            fi
+            if [ $i -eq 30 ]; then
+              echo "❌ Container failed to become healthy"
+              docker logs app-test
+              exit 1
+            fi
+            echo "Waiting... ($i/30)"
+            sleep 5
+          done
+          
+          # Cleanup
+          docker stop app-test redis-test
+          docker rm app-test redis-test
+
+      # Extract changelog section
+      - name: Extract changelog
+        id: changelog
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = `${{ needs.check-releases.outputs.stable_body }}`;
+            
+            // Clean up the changelog body
+            let changelog = body || 'No changelog provided.';
+            
+            // Truncate if too long
+            if (changelog.length > 5000) {
+              changelog = changelog.substring(0, 5000) + '\n\n... (truncated)';
+            }
+            
+            core.setOutput('body', changelog);
+
+      # Create GitHub release
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.check-releases.outputs.stable_version }}
+          name: v${{ needs.check-releases.outputs.stable_version }}
+          body: |
+            ## 🐳 Docker Image
+            
+            ```bash
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.check-releases.outputs.stable_version }}
+            ```
+            
+            ### Available Tags
+            - `${{ needs.check-releases.outputs.stable_version }}` - This version
+            - `${{ steps.version.outputs.major_minor }}` - Latest patch for this minor
+            - `${{ steps.version.outputs.major }}` - Latest for this major
+            - `latest` - Latest stable release
+            
+            ## 📋 Changelog (from upstream)
+            
+            ${{ steps.changelog.outputs.body }}
+            
+            ---
+            
+            📦 **Source**: [cedya77/aiometadata v${{ needs.check-releases.outputs.stable_version }}](https://github.com/cedya77/aiometadata/releases/tag/v${{ needs.check-releases.outputs.stable_version }})
+            
+            🔐 **Image signed with Cosign** - Verify with:
+            ```bash
+            cosign verify ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.check-releases.outputs.stable_version }} --certificate-identity-regexp=".*" --certificate-oidc-issuer-regexp=".*"
+            ```
+          draft: false
+          prerelease: false
+          files: |
+            sbom-stable.spdx.json
+
+  # ============================================
+  # Job 3: Build beta release
+  # ============================================
+  build-beta:
+    name: Build Beta Release
+    needs: check-releases
+    if: needs.check-releases.outputs.has_new_beta == 'true'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Generate Docker tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ needs.check-releases.outputs.beta_version }}
+            type=raw,value=beta
+
+      - name: Build and Push Docker image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ needs.check-releases.outputs.beta_version }}
+            BUILD_DATE=${{ needs.check-releases.outputs.beta_date }}
+            VCS_REF=${{ needs.check-releases.outputs.beta_sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+          outputs: type=image,compression=zstd
+
+      - name: Sign image with Cosign
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          cosign sign --yes ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${DIGEST}
+
+      - name: Generate SBOM attestation
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          artifact-name: sbom-beta-${{ needs.check-releases.outputs.beta_version }}.spdx.json
+          output-file: ./sbom-beta.spdx.json
+
+      # Create GitHub pre-release
+      - name: Create GitHub Pre-Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.check-releases.outputs.beta_version }}
+          name: v${{ needs.check-releases.outputs.beta_version }} (Beta)
+          body: |
+            ## ⚠️ Beta Release
+            
+            This is a pre-release version and may contain bugs.
+            
+            ## 🐳 Docker Image
+            
+            ```bash
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.check-releases.outputs.beta_version }}
+            # or
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:beta
+            ```
+            
+            ---
+            
+            📦 **Source**: [cedya77/aiometadata v${{ needs.check-releases.outputs.beta_version }}](https://github.com/cedya77/aiometadata/releases/tag/v${{ needs.check-releases.outputs.beta_version }})
+          draft: false
+          prerelease: true
+          files: |
+            sbom-beta.spdx.json
+
+  # ============================================
+  # Job 4: Update README badge
+  # ============================================
+  update-badge:
+    name: Update README Badge
+    needs: [check-releases, build-stable, build-beta]
+    if: always() && (needs.build-stable.result == 'success' || needs.build-beta.result == 'success')
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Update last check badge
+        run: |
+          TIMESTAMP=$(date -u +%Y-%m-%d\ %H:%M\ UTC)
+          
+          # Update the badge in README if it exists
+          if grep -q "Last Check:" README.md 2>/dev/null; then
+            sed -i "s/Last Check: .*/Last Check: ${TIMESTAMP}/" README.md
+          fi
+
+      - name: Commit badge update
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: update last check timestamp"
+          file_pattern: README.md
+          skip_dirty_check: false
