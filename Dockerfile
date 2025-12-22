@@ -15,8 +15,8 @@ ARG VERSION
 
 WORKDIR /app
 
-# Install git for cloning
-RUN apk add --no-cache git
+# Install git and build dependencies for native modules (sqlite3, etc.)
+RUN apk add --no-cache git python3 make g++
 
 # Clone specific version from source repository
 RUN if [ "$VERSION" = "latest" ]; then \
@@ -34,25 +34,12 @@ RUN npm run build
 # Build backend (TypeScript)
 RUN npm run build:backend
 
-# ============================================
-# Stage 2: Production Dependencies
-# ============================================
-FROM node:20-alpine AS deps
-
-WORKDIR /app
-
-# Install build dependencies for native modules (sqlite3, better-sqlite3, etc.)
-RUN apk add --no-cache python3 make g++ 
-
-# Copy package files from builder
-COPY --from=builder /app/package*.json ./
-
-# Install production dependencies with native compilation
-RUN npm ci --production && \
-    npm cache clean --force
+# Prune devDependencies to keep only production deps
+# Native modules are already compiled for the target architecture
+RUN npm prune --omit=dev
 
 # ============================================
-# Stage 3: Final Production Image
+# Stage 2: Final Production Image
 # ============================================
 FROM node:20-alpine AS runner
 
@@ -82,8 +69,8 @@ WORKDIR /app
 # - wget: for healthcheck
 RUN apk add --no-cache ca-certificates wget
 
-# Copy production dependencies from deps stage
-COPY --from=deps /app/node_modules ./node_modules
+# Copy production node_modules from builder (already pruned)
+COPY --from=builder /app/node_modules ./node_modules
 
 # Copy package.json for version info
 COPY --from=builder /app/package*.json ./
