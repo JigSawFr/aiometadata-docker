@@ -54,26 +54,47 @@ jobs:
 
       - name: Detect versions from registry
         id: detect
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           INPUT_VERSIONS="${{ inputs.versions }}"
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
           
           if [[ "$INPUT_VERSIONS" == "all" ]]; then
             echo "🔍 Auto-detecting versions from registry..."
             
-            # Get all tags from ghcr.io
-            TOKEN=$(echo ${{ secrets.GITHUB_TOKEN }} | base64)
+            # Get token for ghcr.io using docker login credentials
+            TOKEN=$(echo "$GH_TOKEN" | docker login ghcr.io -u ${{ github.actor }} --password-stdin 2>/dev/null && \
+                    cat ~/.docker/config.json | jq -r '.auths["ghcr.io"].auth' | base64 -d | cut -d: -f2)
             
-            # List all tags that match version-arch pattern
-            TAGS=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-              "https://ghcr.io/v2/${{ env.IMAGE_NAME }}/tags/list" | jq -r '.tags[]' 2>/dev/null || echo "")
+            # Use skopeo or docker to list tags
+            echo "📋 Fetching tags from registry..."
+            TAGS=$(docker run --rm quay.io/skopeo/stable list-tags docker://${IMAGE} 2>/dev/null | jq -r '.Tags[]' || echo "")
+            
+            if [[ -z "$TAGS" ]]; then
+              echo "⚠️ Could not fetch tags via skopeo, trying alternative method..."
+              # Fallback: use GitHub API to get package versions
+              TAGS=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github.v3+json" \
+                "https://api.github.com/users/${{ github.repository_owner }}/packages/container/${{ github.event.repository.name }}/versions?per_page=100" \
+                | jq -r '.[].metadata.container.tags[]' 2>/dev/null || echo "")
+            fi
             
             if [[ -z "$TAGS" ]]; then
               echo "❌ Could not fetch tags from registry"
-              exit 1
+              echo "versions=[]" >> $GITHUB_OUTPUT
+              echo "latest_stable=" >> $GITHUB_OUTPUT
+              exit 0
             fi
+            
+            echo "Found tags:"
+            echo "$TAGS" | head -20
             
             # Extract unique versions (those with -amd64 suffix)
             VERSIONS=$(echo "$TAGS" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?-amd64$' | sed 's/-amd64$//' | sort -V | uniq)
+            
+            echo "Found versions with -amd64 suffix:"
+            echo "$VERSIONS"
             
             # Filter to only versions that have both amd64 and arm64
             VALID_VERSIONS=""
@@ -83,19 +104,27 @@ jobs:
               
               if [[ "$HAS_AMD64" -gt 0 && "$HAS_ARM64" -gt 0 ]]; then
                 # Check if manifest already exists
-                if docker manifest inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${VERSION} > /dev/null 2>&1; then
+                if docker manifest inspect ${IMAGE}:${VERSION} > /dev/null 2>&1; then
                   echo "⏭️ Manifest already exists for ${VERSION}, skipping"
                 else
+                  echo "✅ Will create manifest for ${VERSION}"
                   VALID_VERSIONS="${VALID_VERSIONS}${VERSION}\n"
                 fi
               fi
             done
             
+            if [[ -z "$VALID_VERSIONS" ]]; then
+              echo "ℹ️ No versions need manifests"
+              echo "versions=[]" >> $GITHUB_OUTPUT
+              echo "latest_stable=" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            
             VERSIONS_JSON=$(echo -e "$VALID_VERSIONS" | grep -v '^$' | jq -R -s -c 'split("\n") | map(select(length > 0))')
             echo "versions=${VERSIONS_JSON}" >> $GITHUB_OUTPUT
             
             # Find latest stable version
-            LATEST_STABLE=$(echo -e "$VALID_VERSIONS" | grep -v 'beta\|alpha' | sort -V | tail -1)
+            LATEST_STABLE=$(echo -e "$VALID_VERSIONS" | grep -v 'beta\|alpha' | grep -v '^$' | sort -V | tail -1)
             echo "latest_stable=${LATEST_STABLE}" >> $GITHUB_OUTPUT
             
             echo "📋 Versions to process: ${VERSIONS_JSON}"
