@@ -200,10 +200,13 @@ jobs:
         run: |
           VERSION="${{ needs.check-trigger.outputs.version }}"
           IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
-          DIGEST=$(docker manifest inspect ${IMAGE}:${VERSION} -v | jq -r '.Descriptor.digest')
+          
+          # Get the manifest list digest (not individual arch digests)
+          DIGEST=$(docker buildx imagetools inspect --raw ${IMAGE}:${VERSION} | sha256sum | awk '{print "sha256:"$1}')
           
           echo "🔐 Signing ${IMAGE}@${DIGEST}..."
           cosign sign --yes ${IMAGE}@${DIGEST}
+          echo "✅ Signed successfully"
 
       - name: Test container
         run: |

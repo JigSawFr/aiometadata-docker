@@ -1,0 +1,292 @@
+# ============================================
+# Create Manifests Only
+# Creates multi-arch manifests for already-built images
+# Use when arch-specific images exist but manifests failed
+# ============================================
+
+name: Create Manifests Only
+
+on:
+  workflow_dispatch:
+    inputs:
+      versions:
+        description: 'Comma-separated versions to process (e.g., "1.0.0,1.0.1,1.1.0") or "all" for auto-detect'
+        required: true
+        default: 'all'
+      create_latest:
+        description: 'Update latest tag with highest stable version'
+        required: false
+        default: true
+        type: boolean
+      dry_run:
+        description: 'Dry run (show what would be done)'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: jigsawfr/aiometadata-docker
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write  # For cosign OIDC
+
+jobs:
+  # ============================================
+  # Job 1: Detect versions to process
+  # ============================================
+  detect-versions:
+    name: Detect Versions
+    runs-on: ubuntu-latest
+    outputs:
+      versions: ${{ steps.detect.outputs.versions }}
+      latest_stable: ${{ steps.detect.outputs.latest_stable }}
+    
+    steps:
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Detect versions from registry
+        id: detect
+        run: |
+          INPUT_VERSIONS="${{ inputs.versions }}"
+          
+          if [[ "$INPUT_VERSIONS" == "all" ]]; then
+            echo "🔍 Auto-detecting versions from registry..."
+            
+            # Get all tags from ghcr.io
+            TOKEN=$(echo ${{ secrets.GITHUB_TOKEN }} | base64)
+            
+            # List all tags that match version-arch pattern
+            TAGS=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              "https://ghcr.io/v2/${{ env.IMAGE_NAME }}/tags/list" | jq -r '.tags[]' 2>/dev/null || echo "")
+            
+            if [[ -z "$TAGS" ]]; then
+              echo "❌ Could not fetch tags from registry"
+              exit 1
+            fi
+            
+            # Extract unique versions (those with -amd64 suffix)
+            VERSIONS=$(echo "$TAGS" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?-amd64$' | sed 's/-amd64$//' | sort -V | uniq)
+            
+            # Filter to only versions that have both amd64 and arm64
+            VALID_VERSIONS=""
+            for VERSION in $VERSIONS; do
+              HAS_AMD64=$(echo "$TAGS" | grep -c "^${VERSION}-amd64$" || echo "0")
+              HAS_ARM64=$(echo "$TAGS" | grep -c "^${VERSION}-arm64$" || echo "0")
+              
+              if [[ "$HAS_AMD64" -gt 0 && "$HAS_ARM64" -gt 0 ]]; then
+                # Check if manifest already exists
+                if docker manifest inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${VERSION} > /dev/null 2>&1; then
+                  echo "⏭️ Manifest already exists for ${VERSION}, skipping"
+                else
+                  VALID_VERSIONS="${VALID_VERSIONS}${VERSION}\n"
+                fi
+              fi
+            done
+            
+            VERSIONS_JSON=$(echo -e "$VALID_VERSIONS" | grep -v '^$' | jq -R -s -c 'split("\n") | map(select(length > 0))')
+            echo "versions=${VERSIONS_JSON}" >> $GITHUB_OUTPUT
+            
+            # Find latest stable version
+            LATEST_STABLE=$(echo -e "$VALID_VERSIONS" | grep -v 'beta\|alpha' | sort -V | tail -1)
+            echo "latest_stable=${LATEST_STABLE}" >> $GITHUB_OUTPUT
+            
+            echo "📋 Versions to process: ${VERSIONS_JSON}"
+            echo "🏷️ Latest stable: ${LATEST_STABLE}"
+          else
+            # Parse comma-separated input
+            VERSIONS_JSON=$(echo "$INPUT_VERSIONS" | tr ',' '\n' | jq -R -s -c 'split("\n") | map(select(length > 0) | gsub("^\\s+|\\s+$";""))')
+            echo "versions=${VERSIONS_JSON}" >> $GITHUB_OUTPUT
+            
+            # Find latest stable from input
+            LATEST_STABLE=$(echo "$INPUT_VERSIONS" | tr ',' '\n' | grep -v 'beta\|alpha' | sort -V | tail -1)
+            echo "latest_stable=${LATEST_STABLE}" >> $GITHUB_OUTPUT
+            
+            echo "📋 Versions to process: ${VERSIONS_JSON}"
+          fi
+
+  # ============================================
+  # Job 2: Create manifests
+  # ============================================
+  create-manifests:
+    name: Create Manifest ${{ matrix.version }}
+    needs: detect-versions
+    if: needs.detect-versions.outputs.versions != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        version: ${{ fromJson(needs.detect-versions.outputs.versions) }}
+    
+    steps:
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify arch images exist
+        id: verify
+        run: |
+          VERSION="${{ matrix.version }}"
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          
+          echo "🔍 Verifying images for ${VERSION}..."
+          
+          AMD64_EXISTS=$(docker manifest inspect ${IMAGE}:${VERSION}-amd64 > /dev/null 2>&1 && echo "true" || echo "false")
+          ARM64_EXISTS=$(docker manifest inspect ${IMAGE}:${VERSION}-arm64 > /dev/null 2>&1 && echo "true" || echo "false")
+          
+          echo "  amd64: ${AMD64_EXISTS}"
+          echo "  arm64: ${ARM64_EXISTS}"
+          
+          if [[ "$AMD64_EXISTS" != "true" || "$ARM64_EXISTS" != "true" ]]; then
+            echo "❌ Missing arch-specific images for ${VERSION}"
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          echo "skip=false" >> $GITHUB_OUTPUT
+
+      - name: Extract version components
+        if: steps.verify.outputs.skip != 'true'
+        id: version-parts
+        run: |
+          VERSION="${{ matrix.version }}"
+          
+          # Check if it's a prerelease
+          if [[ "$VERSION" == *"beta"* || "$VERSION" == *"alpha"* ]]; then
+            echo "is_prerelease=true" >> $GITHUB_OUTPUT
+          else
+            MAJOR=$(echo $VERSION | cut -d. -f1)
+            MINOR=$(echo $VERSION | cut -d. -f2)
+            echo "major=$MAJOR" >> $GITHUB_OUTPUT
+            echo "minor=$MINOR" >> $GITHUB_OUTPUT
+            echo "major_minor=${MAJOR}.${MINOR}" >> $GITHUB_OUTPUT
+            echo "is_prerelease=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create multi-arch manifest
+        if: steps.verify.outputs.skip != 'true'
+        run: |
+          VERSION="${{ matrix.version }}"
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          DRY_RUN="${{ inputs.dry_run }}"
+          IS_PRERELEASE="${{ steps.version-parts.outputs.is_prerelease }}"
+          IS_LATEST_STABLE="${{ matrix.version == needs.detect-versions.outputs.latest_stable && inputs.create_latest }}"
+          
+          echo "📦 Creating manifest for ${VERSION}..."
+          
+          if [[ "$DRY_RUN" == "true" ]]; then
+            echo "[DRY RUN] Would create:"
+            echo "  - ${IMAGE}:${VERSION}"
+            if [[ "$IS_PRERELEASE" == "true" ]]; then
+              echo "  - ${IMAGE}:beta"
+            else
+              echo "  - ${IMAGE}:${{ steps.version-parts.outputs.major_minor }}"
+              echo "  - ${IMAGE}:${{ steps.version-parts.outputs.major }}"
+              if [[ "$IS_LATEST_STABLE" == "true" ]]; then
+                echo "  - ${IMAGE}:latest"
+              fi
+            fi
+            exit 0
+          fi
+          
+          # Create version manifest
+          docker manifest create ${IMAGE}:${VERSION} \
+            ${IMAGE}:${VERSION}-amd64 \
+            ${IMAGE}:${VERSION}-arm64
+          docker manifest push ${IMAGE}:${VERSION}
+          echo "✅ Created ${IMAGE}:${VERSION}"
+          
+          if [[ "$IS_PRERELEASE" == "true" ]]; then
+            # Beta tag
+            docker manifest create ${IMAGE}:beta \
+              ${IMAGE}:${VERSION}-amd64 \
+              ${IMAGE}:${VERSION}-arm64 --amend || \
+            docker manifest create ${IMAGE}:beta \
+              ${IMAGE}:${VERSION}-amd64 \
+              ${IMAGE}:${VERSION}-arm64
+            docker manifest push ${IMAGE}:beta
+            echo "✅ Updated ${IMAGE}:beta"
+          else
+            # Major.minor tag
+            docker manifest create ${IMAGE}:${{ steps.version-parts.outputs.major_minor }} \
+              ${IMAGE}:${VERSION}-amd64 \
+              ${IMAGE}:${VERSION}-arm64 --amend || \
+            docker manifest create ${IMAGE}:${{ steps.version-parts.outputs.major_minor }} \
+              ${IMAGE}:${VERSION}-amd64 \
+              ${IMAGE}:${VERSION}-arm64
+            docker manifest push ${IMAGE}:${{ steps.version-parts.outputs.major_minor }}
+            echo "✅ Updated ${IMAGE}:${{ steps.version-parts.outputs.major_minor }}"
+            
+            # Major tag
+            docker manifest create ${IMAGE}:${{ steps.version-parts.outputs.major }} \
+              ${IMAGE}:${VERSION}-amd64 \
+              ${IMAGE}:${VERSION}-arm64 --amend || \
+            docker manifest create ${IMAGE}:${{ steps.version-parts.outputs.major }} \
+              ${IMAGE}:${VERSION}-amd64 \
+              ${IMAGE}:${VERSION}-arm64
+            docker manifest push ${IMAGE}:${{ steps.version-parts.outputs.major }}
+            echo "✅ Updated ${IMAGE}:${{ steps.version-parts.outputs.major }}"
+            
+            # Latest tag (only for the latest stable)
+            if [[ "$IS_LATEST_STABLE" == "true" ]]; then
+              docker manifest create ${IMAGE}:latest \
+                ${IMAGE}:${VERSION}-amd64 \
+                ${IMAGE}:${VERSION}-arm64 --amend || \
+              docker manifest create ${IMAGE}:latest \
+                ${IMAGE}:${VERSION}-amd64 \
+                ${IMAGE}:${VERSION}-arm64
+              docker manifest push ${IMAGE}:latest
+              echo "✅ Updated ${IMAGE}:latest"
+            fi
+          fi
+
+      - name: Install Cosign
+        if: steps.verify.outputs.skip != 'true' && inputs.dry_run != true
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign manifest
+        if: steps.verify.outputs.skip != 'true' && inputs.dry_run != true
+        run: |
+          VERSION="${{ matrix.version }}"
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          
+          # Get the manifest list digest
+          DIGEST=$(docker buildx imagetools inspect --raw ${IMAGE}:${VERSION} | sha256sum | awk '{print "sha256:"$1}')
+          
+          echo "🔐 Signing ${IMAGE}@${DIGEST}..."
+          cosign sign --yes ${IMAGE}@${DIGEST}
+          echo "✅ Signed successfully"
+
+  # ============================================
+  # Job 3: Summary
+  # ============================================
+  summary:
+    name: Summary
+    needs: [detect-versions, create-manifests]
+    if: always()
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Generate summary
+        run: |
+          echo "## 📦 Manifest Creation Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Configuration" >> $GITHUB_STEP_SUMMARY
+          echo "- **Input versions**: ${{ inputs.versions }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Dry run**: ${{ inputs.dry_run }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Update latest**: ${{ inputs.create_latest }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Detected" >> $GITHUB_STEP_SUMMARY
+          echo "- **Versions processed**: ${{ needs.detect-versions.outputs.versions }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Latest stable**: ${{ needs.detect-versions.outputs.latest_stable }}" >> $GITHUB_STEP_SUMMARY
