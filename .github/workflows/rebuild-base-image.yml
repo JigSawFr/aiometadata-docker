@@ -221,7 +221,7 @@ jobs:
             -p 1337:1337 \
             -e REDIS_URL=redis://redis:6379 \
             -e HOST_NAME=http://localhost:1337 \
-            -e DATABASE_URL=file:./addon/data/addon.db \
+            -e DATABASE_URI=file:./addon/data/addon.db \
             -e TMDB_API=test \
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.check-trigger.outputs.version }}
           
