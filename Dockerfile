@@ -104,4 +104,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD wget -q --spider http://localhost:1337/api/cache/health || exit 1
 
 # Start the application
-ENTRYPOINT ["node", "dist/server.js"]
+ENTRYPOINT ["node", "dist/server/server.js"]
