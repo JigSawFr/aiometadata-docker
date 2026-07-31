@@ -77,7 +77,7 @@ services:
     
     # Health check configuration
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:1337/api/cache/health"]
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:1337/health/live"]
       interval: 30s
       timeout: 10s
       start_period: 60s
