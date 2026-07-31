@@ -101,7 +101,7 @@ ENV NODE_ENV=production \
 # - start-period: Wait 60 seconds for app to start (initial warmup)
 # - retries: Mark unhealthy after 3 consecutive failures
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD wget -q --spider http://localhost:1337/api/cache/health || exit 1
+    CMD wget -q --spider http://localhost:1337/health/live || exit 1
 
 # Start the application
 ENTRYPOINT ["node", "dist/server.js"]
