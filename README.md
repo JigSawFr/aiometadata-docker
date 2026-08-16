@@ -179,7 +179,7 @@ cosign verify ghcr.io/jigsawfr/aiometadata-docker:latest \
 
 ## 🩺 Health Check
 
-The container includes a built-in health check:
+The container includes a built-in liveness check:
 
 ```dockerfile
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
@@ -201,8 +201,8 @@ Access the dashboard at `http://your-host:1337/dashboard` (requires `ADMIN_KEY` 
 |----------|-------------|
 | `/` | Configuration UI |
 | `/dashboard` | Admin dashboard |
-| `/health/live` | Unauthenticated liveness check |
-| `/api/cache/health` | Cache statistics (requires `ADMIN_KEY` when configured) |
+| `/health/live` | Liveness health check endpoint (no admin auth required) |
+| `/api/cache/health` | Cache health statistics endpoint (admin-only when `ADMIN_KEY` is set) |
 | `/stremio/:uuid/manifest.json` | Stremio manifest |
 
 ## 🔄 Updates

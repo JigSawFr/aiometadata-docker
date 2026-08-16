@@ -5,37 +5,79 @@ on:
   push:
     branches:
       - main
+  workflow_run:
+    workflows: ["Rebuild Base Image"]
+    types: [completed]
 
 jobs:
   smoke-test:
+    name: Smoke Test Latest Image
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+
     steps:
       - name: Pull latest image
+        env:
+          IMAGE: ghcr.io/jigsawfr/aiometadata-docker:latest
         run: |
-          IMAGE=ghcr.io/jigsawfr/aiometadata-docker:latest
-          echo "Pulling $IMAGE"
-          docker pull $IMAGE || exit 1
+          echo "Pulling ${IMAGE}"
+          docker pull "${IMAGE}"
 
-      - name: Run container and test /health/live
+      - name: Start Redis dependency
         run: |
-          IMAGE=ghcr.io/jigsawfr/aiometadata-docker:latest
-          docker run -d --name app-test -p 1337:1337 $IMAGE || exit 1
-          # wait for startup
-          for i in {1..30}; do
-            if curl -sfS http://localhost:1337/health/live > /dev/null 2>&1; then
-              echo "Container responding"
+          docker run -d --name redis-test -p 6379:6379 redis:alpine
+          for i in $(seq 1 30); do
+            if docker exec redis-test redis-cli ping >/dev/null 2>&1; then
+              echo "Redis is ready"
               break
             fi
-            echo "Waiting for container... ($i)"
+            echo "Waiting for Redis... ($i/30)"
+            sleep 2
+          done
+          docker exec redis-test redis-cli ping >/dev/null 2>&1 || {
+            echo "Redis did not become ready"
+            docker logs redis-test || true
+            exit 1
+          }
+
+      - name: Start app and smoke test
+        env:
+          IMAGE: ghcr.io/jigsawfr/aiometadata-docker:latest
+        run: |
+          docker run -d --name app-test \
+            --link redis-test:redis \
+            -p 1337:1337 \
+            -e REDIS_URL=redis://redis:6379 \
+            -e HOST_NAME=http://localhost:1337 \
+            -e DATABASE_URL=file:./addon/data/addon.db \
+            -e TMDB_API=test \
+            "${IMAGE}"
+
+          READY=false
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:1337/health/live > /tmp/health.out 2>/tmp/health.err; then
+              echo "Container is responding on /health/live"
+              READY=true
+              break
+            fi
+            echo "Waiting for app... ($i/60)"
             sleep 5
           done
-          if ! curl -sfS http://localhost:1337/health/live > /dev/null 2>&1; then
-            echo "Smoke test failed: /health/live not responding"
-            docker logs app-test --tail 200 || true
-            docker stop app-test || true
-            docker rm app-test || true
+
+          if [ "$READY" != "true" ]; then
+            echo "Smoke test failed: /health/live did not respond in time"
+            echo "--- app logs ---"
+            docker logs app-test || true
+            echo "--- curl stderr ---"
+            cat /tmp/health.err 2>/dev/null || true
             exit 1
           fi
-          echo "Smoke test succeeded"
-          docker stop app-test || true
-          docker rm app-test || true
+
+          echo "--- health response ---"
+          cat /tmp/health.out
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker stop app-test redis-test 2>/dev/null || true
+          docker rm -f app-test redis-test 2>/dev/null || true

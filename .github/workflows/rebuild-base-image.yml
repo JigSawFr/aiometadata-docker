@@ -228,9 +228,8 @@ jobs:
           # Wait for container to be ready (non-blocking)
           HEALTHY=false
           for i in {1..30}; do
-            # Try multiple health endpoints
-            if curl -sf http://localhost:1337/health > /dev/null 2>&1 || \
-               curl -sf http://localhost:1337/api/cache/health > /dev/null 2>&1 || \
+            # Use the public liveness endpoint instead of the admin-only cache endpoint
+            if curl -sf http://localhost:1337/health/live > /dev/null 2>&1 || \
                curl -sf http://localhost:1337/ > /dev/null 2>&1; then
               echo "✅ Container is responding!"
               HEALTHY=true
