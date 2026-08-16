@@ -1,0 +1,28 @@
+name: Notify Rebuild Result
+
+on:
+  workflow_run:
+    workflows: ["Rebuild Base Image"]
+    types: [completed]
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post result to issue #1
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          issue-number: 1
+          body: |
+            The "Rebuild Base Image" workflow completed with conclusion: ${{ github.event.workflow_run.conclusion }}.
+
+            Run: ${{ github.event.workflow_run.html_url }}
+            Trigger: ${{ github.event.workflow_run.event }}
+            Head commit: ${{ github.event.workflow_run.head_commit.id }}
+            
+            If the run failed, please check the run logs and open an issue with the failure details.
