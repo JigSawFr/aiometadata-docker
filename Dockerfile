@@ -9,7 +9,7 @@ ARG VERSION=latest
 # ============================================
 # Stage 1: Clone and Build
 # ============================================
-FROM node:20-alpine AS builder
+FROM node:24-alpine AS builder
 
 ARG VERSION
 
@@ -41,7 +41,7 @@ RUN npm prune --omit=dev
 # ============================================
 # Stage 2: Final Production Image
 # ============================================
-FROM node:20-alpine AS runner
+FROM node:24-alpine AS runner
 
 # Build arguments for OCI labels
 ARG VERSION=latest
@@ -60,7 +60,7 @@ LABEL org.opencontainers.image.title="AIOMetadata" \
       org.opencontainers.image.url="https://github.com/JigSawFr/aiometadata-docker" \
       org.opencontainers.image.vendor="JigSawFr" \
       org.opencontainers.image.licenses="MIT" \
-      org.opencontainers.image.base.name="docker.io/library/node:20-alpine"
+      org.opencontainers.image.base.name="docker.io/library/node:24-alpine"
 
 WORKDIR /app
 
