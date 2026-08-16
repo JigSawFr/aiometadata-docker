@@ -1,0 +1,41 @@
+name: Smoke Test Latest Image
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Pull latest image
+        run: |
+          IMAGE=ghcr.io/jigsawfr/aiometadata-docker:latest
+          echo "Pulling $IMAGE"
+          docker pull $IMAGE || exit 1
+
+      - name: Run container and test /health/live
+        run: |
+          IMAGE=ghcr.io/jigsawfr/aiometadata-docker:latest
+          docker run -d --name app-test -p 1337:1337 $IMAGE || exit 1
+          # wait for startup
+          for i in {1..30}; do
+            if curl -sfS http://localhost:1337/health/live > /dev/null 2>&1; then
+              echo "Container responding"
+              break
+            fi
+            echo "Waiting for container... ($i)"
+            sleep 5
+          done
+          if ! curl -sfS http://localhost:1337/health/live > /dev/null 2>&1; then
+            echo "Smoke test failed: /health/live not responding"
+            docker logs app-test --tail 200 || true
+            docker stop app-test || true
+            docker rm app-test || true
+            exit 1
+          fi
+          echo "Smoke test succeeded"
+          docker stop app-test || true
+          docker rm app-test || true
