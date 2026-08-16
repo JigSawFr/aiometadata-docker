@@ -183,7 +183,7 @@ The container includes a built-in health check:
 
 ```dockerfile
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD wget -q --spider http://localhost:1337/api/cache/health || exit 1
+    CMD wget -q --spider http://localhost:1337/health/live || exit 1
 ```
 
 Monitor health status:
@@ -201,7 +201,8 @@ Access the dashboard at `http://your-host:1337/dashboard` (requires `ADMIN_KEY` 
 |----------|-------------|
 | `/` | Configuration UI |
 | `/dashboard` | Admin dashboard |
-| `/api/cache/health` | Health check endpoint |
+| `/health/live` | Unauthenticated liveness check |
+| `/api/cache/health` | Cache statistics (requires `ADMIN_KEY` when configured) |
 | `/stremio/:uuid/manifest.json` | Stremio manifest |
 
 ## 🔄 Updates
